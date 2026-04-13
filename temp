@@ -1,0 +1,286 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"sort"
+	"time"
+)
+
+// -------------------- TYPES --------------------
+
+type StateTransition struct {
+	State string `json:"state"`
+	Time  int64  `json:"state_change_time"`
+}
+
+type Job struct {
+	Name            string            `json:"name"`
+	Pipeline        string            `json:"pipeline_name"`
+	PipelineCounter int               `json:"pipeline_counter"`
+	Stage           string            `json:"stage_name"`
+	Transitions     []StateTransition `json:"job_state_transitions"`
+}
+
+type Stage struct {
+	Name string `json:"name"`
+	Jobs []struct {
+		Name string `json:"name"`
+	} `json:"jobs"`
+}
+
+type Metrics struct {
+	Queue float64
+	Wait  float64
+	Prep  float64
+	Exec  float64
+	Total float64
+}
+
+// -------------------- MAIN --------------------
+
+func main() {
+	baseURL := "https://ci.example.com/go/api"
+	username := "username"
+	password := "password"
+
+	pipeline := "myPipeline"
+	stageNames := []string{"stage1", "stage2", "stage3", "stage4", "stage5", "stage6", "stage7"}
+
+	runs := 20
+
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	// -------------------- STORAGE --------------------
+
+	stageRunMax := make(map[string]map[int]float64) // stage -> run -> max time
+	jobTimes := make(map[string][]float64)          // job -> all times
+
+	var allExec, allQueue, allPrep, allTotal []float64
+
+	// -------------------- LOOP --------------------
+
+	for run := 1; run <= runs; run++ {
+		for _, stage := range stageNames {
+
+			jobs := fetchStageJobs(client, baseURL, pipeline, run, stage, username, password)
+
+			for _, job := range jobs {
+
+				jobData := fetchJob(client, baseURL, pipeline, run, stage, job, username, password)
+				if jobData == nil {
+					continue
+				}
+
+				m := extractMetrics(jobData.Transitions)
+
+				// Global stats
+				allExec = append(allExec, m.Exec)
+				allQueue = append(allQueue, m.Queue)
+				allPrep = append(allPrep, m.Prep)
+				allTotal = append(allTotal, m.Total)
+
+				// Job-level stats
+				jobKey := stage + "::" + jobData.Name
+				jobTimes[jobKey] = append(jobTimes[jobKey], m.Total)
+
+				// Stage-level max per run
+				if stageRunMax[stage] == nil {
+					stageRunMax[stage] = make(map[int]float64)
+				}
+				if m.Total > stageRunMax[stage][run] {
+					stageRunMax[stage][run] = m.Total
+				}
+			}
+		}
+	}
+
+	// -------------------- GLOBAL --------------------
+
+	fmt.Println("==== GLOBAL METRICS ====")
+	printStats("Execution", allExec)
+	printStats("Queue", allQueue)
+	printStats("Prep", allPrep)
+	printStats("Total", allTotal)
+
+	// -------------------- STAGES --------------------
+
+	type StageStat struct {
+		Name string
+		P95  float64
+	}
+
+	var stageStats []StageStat
+
+	for stage, runs := range stageRunMax {
+		var vals []float64
+		for _, v := range runs {
+			vals = append(vals, v)
+		}
+
+		stageStats = append(stageStats, StageStat{
+			Name: stage,
+			P95:  percentile(vals, 0.95),
+		})
+	}
+
+	sort.Slice(stageStats, func(i, j int) bool {
+		return stageStats[i].P95 > stageStats[j].P95
+	})
+
+	fmt.Println("\n==== TOP STAGES (P95) ====")
+	for i := 0; i < min(3, len(stageStats)); i++ {
+		fmt.Printf("%d. %s → %.2f min\n", i+1, stageStats[i].Name, stageStats[i].P95)
+	}
+
+	if len(stageStats) == 0 {
+		return
+	}
+
+	// -------------------- TOP JOBS IN WORST STAGE --------------------
+
+	worstStage := stageStats[0].Name
+
+	fmt.Printf("\n==== TOP JOBS in %s ====\n", worstStage)
+
+	type JobStat struct {
+		Name string
+		P95  float64
+	}
+
+	var jobStats []JobStat
+
+	for job, times := range jobTimes {
+		// filter only jobs in worst stage
+		if !startsWith(job, worstStage+"::") {
+			continue
+		}
+
+		jobStats = append(jobStats, JobStat{
+			Name: job,
+			P95:  percentile(times, 0.95),
+		})
+	}
+
+	sort.Slice(jobStats, func(i, j int) bool {
+		return jobStats[i].P95 > jobStats[j].P95
+	})
+
+	for i := 0; i < min(5, len(jobStats)); i++ {
+		fmt.Printf("%d. %s → %.2f min\n", i+1, jobStats[i].Name, jobStats[i].P95)
+	}
+}
+
+// -------------------- API HELPERS --------------------
+
+func fetchStageJobs(client *http.Client, baseURL, pipeline string, run int, stage, username, password string) []string {
+
+	url := fmt.Sprintf("%s/stages/%s/%d/%s/1", baseURL, pipeline, run, stage)
+
+	req, _ := http.NewRequest("GET", url, nil)
+	req.SetBasicAuth(username, password)
+	req.Header.Set("Accept", "application/vnd.go.cd.v1+json")
+
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != 200 {
+		return nil
+	}
+	defer resp.Body.Close()
+
+	var s Stage
+	json.NewDecoder(resp.Body).Decode(&s)
+
+	var jobs []string
+	for _, j := range s.Jobs {
+		jobs = append(jobs, j.Name)
+	}
+
+	return jobs
+}
+
+func fetchJob(client *http.Client, baseURL, pipeline string, run int, stage, job, username, password string) *Job {
+
+	url := fmt.Sprintf("%s/jobs/%s/%d/%s/1/%s", baseURL, pipeline, run, stage, job)
+
+	req, _ := http.NewRequest("GET", url, nil)
+	req.SetBasicAuth(username, password)
+	req.Header.Set("Accept", "application/vnd.go.cd.v1+json")
+
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != 200 {
+		return nil
+	}
+	defer resp.Body.Close()
+
+	var j Job
+	json.NewDecoder(resp.Body).Decode(&j)
+
+	return &j
+}
+
+// -------------------- METRICS --------------------
+
+func extractMetrics(transitions []StateTransition) Metrics {
+
+	stateMap := make(map[string]int64)
+	for _, t := range transitions {
+		stateMap[t.State] = t.Time
+	}
+
+	toMin := func(ms int64) float64 {
+		return float64(ms) / 1000.0 / 60.0
+	}
+
+	return Metrics{
+		Queue: toMin(stateMap["Assigned"] - stateMap["Scheduled"]),
+		Wait:  toMin(stateMap["Preparing"] - stateMap["Assigned"]),
+		Prep:  toMin(stateMap["Building"] - stateMap["Preparing"]),
+		Exec:  toMin(stateMap["Completed"] - stateMap["Building"]),
+		Total: toMin(stateMap["Completed"] - stateMap["Scheduled"]),
+	}
+}
+
+// -------------------- UTIL --------------------
+
+func percentile(data []float64, p float64) float64 {
+	if len(data) == 0 {
+		return 0
+	}
+
+	sort.Float64s(data)
+
+	idx := p * float64(len(data)-1)
+	l := int(idx)
+	u := l + 1
+
+	if u >= len(data) {
+		return data[l]
+	}
+
+	f := idx - float64(l)
+	return data[l] + f*(data[u]-data[l])
+}
+
+func printStats(name string, data []float64) {
+	if len(data) == 0 {
+		return
+	}
+
+	fmt.Printf("%s → P50: %.2f | P95: %.2f\n",
+		name,
+		percentile(data, 0.50),
+		percentile(data, 0.95),
+	)
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func startsWith(s, prefix string) bool {
+	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
+}
